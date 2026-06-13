@@ -31,6 +31,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw(format!(" 0x{:X}/0x{:X}", app.cursor, app.buf.len())),
     ];
+    if app.docs.len() > 1 {
+        spans.push(Span::styled(
+            format!("  [{}/{}]", app.active + 1, app.docs.len()),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
     if let Some((s, e)) = app.selection() {
         spans.push(Span::styled(
             format!("  sel 0x{s:X}..0x{e:X} ({} B)", e - s),

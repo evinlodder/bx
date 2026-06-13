@@ -1,4 +1,5 @@
 pub mod arch;
+pub mod checksum;
 pub mod cyclic;
 pub mod entropy;
 pub mod headers;

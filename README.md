@@ -7,8 +7,8 @@ architecture detection. Built for firmware blobs — files are memory-mapped,
 so multi-hundred-MB images open instantly and navigation stays smooth.
 
 ```
-┌ fw.bin ───────────────────────────────────────────────┐┌───────────────────────────┐
-│00000000  41 4E 44 52 4F 49 44 21  00 00 80 00  ANDROID!││ Marks │ Analysis │ … │   │
+┌ fw.bin ────────────────────────────────────────────────┐┌───────────────────────────┐
+│00000000  41 4E 44 52 4F 49 44 21  00 00 80 00  ANDROID!││ Marks │ Analysis │ … │    │
 │00000010  00 00 20 00 00 00 00 00  00 00 00 00  ·· ·····││ bhdr.kernel_size u32le    │
 │…                                                       ││   = 8388608 (0x800000)    │
 └────────────────────────────────────────────────────────┘└───────────────────────────┘
@@ -29,7 +29,8 @@ Pure-cargo dependencies only (ratatui, crossterm, memmap2, md5, serde).
 
 ```sh
 bx file.bin              # open in the TUI
-bx a.bin b.bin           # open with a side-by-side diff
+bx a.bin b.bin c.bin     # open several files as tabs (gt/gT to switch)
+bx --diff a.bin b.bin    # open with a side-by-side diff
 bx file.bin --batch      # headless: print file info, magic hits, parsed
                          # headers and arch summary to stdout, then exit
 ```
@@ -53,16 +54,19 @@ tab of the side pane.
 | `/` | search — hex with wildcards (`de ad ?? ef`) or string (`"text"`, matches ASCII **and** UTF-16LE) |
 | `n` / `N` | next / prev search hit (or diff hunk while a diff is open) |
 | `{` / `}` | prev / next magic-byte hit |
+| `<` / `>` | smaller / larger side-pane |
 | `v` | visual selection (movement extends; `Esc`/`v` ends) |
 | `m` (in visual) | pre-fill `:mark` for the selection |
 | `x` | XOR brute-force the selection (keys 0x00–0xFF, printable hits ranked) |
 | `c` | cyclic / repeating-structure detection on the selection |
+| `#` | checksums (CRC32/MD5/SHA1/SHA256/…) of the selection, or whole file |
+| `gt` / `gT` | switch to next / previous open file |
 | `i` | edit mode — type hex nibbles; `Tab` switches to ASCII overtype; `Esc` ends |
 | `u` / `Ctrl-r` | undo / redo (grouped per edit session) |
 | `e` | toggle entropy graph |
-| `Tab` | cycle side-pane tab (Marks → Analysis → Entropy → Output) |
+| `Tab` | cycle side-pane tab (Marks → Inspect → Analysis → Entropy → Output) |
 | `J` / `K` | scroll side pane |
-| `q` | quit (refuses if unsaved; `:q!` discards) |
+| `q` | quit / close active file (refuses if unsaved; `:q!` discards) |
 
 ## Commands
 
@@ -75,10 +79,15 @@ tab of the side pane.
 :loadstructs <file.bxs>   load extra struct definitions
 :diff <file> / :diffoff   side-by-side diff; changed/added/removed colored
 :xor / :cyclic            analyze the last visual selection
+:checksum [start end]     CRC32/Adler/MD5/SHA1/SHA256 of a range (default: selection/file)
+:e <file>                 open another file in a new tab
+:bn :bp :b <n> :ls        next / prev / nth file; list open files
+:close  :bd[!]            close the active file
 :export <report.json>     JSON report: file info + annotations with parsed values
 :w [file]                 write patches in place, or a patched copy to [file]
-:q  :q!  :wq              quit / force quit / write+quit
-:info :entropy :help      switch side-pane tabs
+:revert                   discard unsaved edits in the active file
+:q  :q!  :wq  :qa[!]      quit-or-close / discard / write+quit / quit all
+:info :inspect :entropy :help    switch side-pane tabs
 ```
 
 ## Annotations (`.bxa`)
@@ -131,6 +140,21 @@ struct boot_hdr {
   candidates ranked by printability/text-likeness with decoded previews.
 - **Cyclic detection** — select a region, press `c`; reports repeating record
   periods (2–64 bytes) by self-similarity.
+- **Checksums** — press `#` (or `:checksum`) to compute Sum8/16/32, XOR8,
+  Adler-32, CRC32, MD5, SHA-1 and SHA-256 over the selection (or the whole
+  file if nothing is selected). CRC/Adler/SHA are hand-rolled — no extra deps.
+- **Data inspector** — the **Inspect** tab decodes the bytes at the cursor as
+  every integer width (signed/unsigned, LE/BE), `float32`/`float64`, a 32-bit
+  `time_t`, plus hex/octal/binary/ASCII — live, no `:mark` needed.
+
+## Multiple files
+
+Open several files at once (`bx a b c`, or `:e <file>` while running); each is
+a tab in the strip across the top with its own cursor, annotations, search and
+analysis. `gt`/`gT` (or `:bn`/`:bp`/`:b <n>`) switch between them, `:ls` lists
+them, `:close` closes one. `:q` closes the active file and only quits once the
+last one is gone (`:qa` quits everything). `:diff` is still the way to compare
+two files byte-for-byte side by side.
 
 ## Editing model
 

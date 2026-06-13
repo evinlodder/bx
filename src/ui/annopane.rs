@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Paragraph, Tabs, Wrap};
 
 use crate::analysis::entropy;
 use crate::app::{App, SideTab};
+use crate::inspector;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::bordered();
@@ -16,12 +17,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let [tab_area, body] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
 
-    let titles = ["Marks", "Analysis", "Entropy", "Output"];
+    let titles = ["Marks", "Inspect", "Analysis", "Entropy", "Output"];
     let selected = match app.side_tab {
         SideTab::Marks => 0,
-        SideTab::Analysis => 1,
-        SideTab::Entropy => 2,
-        SideTab::Output => 3,
+        SideTab::Inspect => 1,
+        SideTab::Analysis => 2,
+        SideTab::Entropy => 3,
+        SideTab::Output => 4,
     };
     let tabs = Tabs::new(titles.iter().map(|t| Line::from(*t)))
         .select(selected)
@@ -34,6 +36,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let lines: Vec<Line> = match app.side_tab {
         SideTab::Marks => marks_lines(app),
+        SideTab::Inspect => inspect_lines(app),
         SideTab::Analysis => app.info_lines().into_iter().map(Line::from).collect(),
         SideTab::Entropy => entropy_lines(app, body),
         SideTab::Output => app.output_lines.iter().cloned().map(Line::from).collect(),
@@ -77,6 +80,18 @@ fn marks_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+fn inspect_lines(app: &App) -> Vec<Line<'static>> {
+    inspector::lines(&app.buf, app.cursor)
+        .into_iter()
+        .map(|(label, value)| {
+            Line::from(vec![
+                Span::styled(format!("{label:<11}"), Style::default().fg(Color::DarkGray)),
+                Span::styled(value, Style::default().fg(app.config.color_annotation)),
+            ])
+        })
+        .collect()
+}
+
 fn entropy_lines(app: &mut App, body: Rect) -> Vec<Line<'static>> {
     let buckets = body.height.max(1) as usize;
     // Cache: the whole-file pass is too expensive to redo every keystroke.
@@ -85,8 +100,8 @@ fn entropy_lines(app: &mut App, body: Rect) -> Vec<Line<'static>> {
         .as_ref()
         .is_none_or(|(b, _)| *b != buckets);
     if recompute {
-        let data = app.buf.raw();
-        app.entropy_cache = Some((buckets, entropy::bucketed(data, buckets)));
+        let computed = entropy::bucketed(app.buf.raw(), buckets);
+        app.entropy_cache = Some((buckets, computed));
     }
     let (_, rows) = app.entropy_cache.as_ref().unwrap();
     let offset_w = format!("{:X}", app.buf.len().max(0x100)).len().max(8);

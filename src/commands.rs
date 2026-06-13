@@ -56,6 +56,14 @@ pub fn execute(app: &mut App, line: &str) {
         "applystruct" => cmd_applystruct(app, &args),
         "loadstructs" => cmd_loadstructs(app, &args),
         "export" => cmd_export(app, &args),
+        "checksum" | "cksum" | "hash" => cmd_checksum(app, &args),
+        "e" | "edit" | "open" => cmd_open(app, &args),
+        "bn" | "bnext" => app.switch_file(1),
+        "bp" | "bprev" => app.switch_file(-1),
+        "b" | "buffer" => cmd_buffer(app, &args),
+        "ls" | "files" | "buffers" => cmd_files(app),
+        "close" | "bd" => app.request_close(false),
+        "bd!" => app.request_close(true),
         "w" | "wq" => {
             let target = args.first().map(PathBuf::from);
             match app.buf.save(target.as_deref()) {
@@ -67,25 +75,36 @@ pub fn execute(app: &mut App, line: &str) {
                     app.save_annotations();
                     app.message = format!("wrote {}", path.display());
                     if cmd == "wq" {
-                        app.quit = true;
+                        app.request_close(false);
                     }
                 }
                 Err(e) => app.message = format!("write failed: {e}"),
             }
         }
-        "q" => {
+        "revert" => {
             if app.buf.has_unsaved_changes() {
-                app.message = "unsaved changes (:w to save, :q! to discard)".into();
+                app.buf.discard_edits();
+                app.message = "reverted unsaved edits".into();
+            } else {
+                app.message = "no unsaved edits".into();
+            }
+        }
+        "q" => app.request_close(false),
+        "q!" => app.request_close(true),
+        "qa" | "qall" => {
+            if app.docs.iter().any(|d| d.buf.has_unsaved_changes()) {
+                app.message = "unsaved changes in some files (:qa! to discard all)".into();
             } else {
                 app.quit = true;
             }
         }
-        "q!" => {
-            app.buf.discard_edits();
-            app.quit = true;
-        }
+        "qa!" | "qall!" => app.quit = true,
         "info" => {
             app.side_tab = SideTab::Analysis;
+            app.side_scroll = 0;
+        }
+        "inspect" => {
+            app.side_tab = SideTab::Inspect;
             app.side_scroll = 0;
         }
         "entropy" => {
@@ -228,6 +247,58 @@ fn cmd_loadstructs(app: &mut App, args: &[&str]) {
     }
 }
 
+fn cmd_checksum(app: &mut App, args: &[&str]) {
+    let range = if args.is_empty() {
+        // last visual selection, else whole file
+        app.last_selection
+    } else if args.len() == 2 {
+        match (
+            parse_offset(args[0], &app.annotations),
+            parse_offset(args[1], &app.annotations),
+        ) {
+            (Some(s), Some(e)) if s < e && e <= app.buf.len() => Some((s, e)),
+            _ => {
+                app.message = format!("bad range '{} {}'", args[0], args[1]);
+                return;
+            }
+        }
+    } else {
+        app.message = "usage: :checksum [start end]  (default: selection or whole file)".into();
+        return;
+    };
+    app.run_checksum(range);
+}
+
+fn cmd_open(app: &mut App, args: &[&str]) {
+    let Some(file) = args.first() else {
+        app.message = "usage: :e <file>".into();
+        return;
+    };
+    if let Err(e) = app.open_file(Path::new(file)) {
+        app.message = format!("open: {e}");
+    }
+}
+
+fn cmd_buffer(app: &mut App, args: &[&str]) {
+    let Some(n) = args.first().and_then(|s| s.parse::<usize>().ok()) else {
+        app.message = "usage: :b <n>".into();
+        return;
+    };
+    app.goto_file(n.saturating_sub(1));
+}
+
+fn cmd_files(app: &mut App) {
+    let mut lines = vec![format!("{} open file(s):", app.docs.len())];
+    for (i, d) in app.docs.iter().enumerate() {
+        let marker = if i == app.active { '>' } else { ' ' };
+        let dirty = if d.buf.has_unsaved_changes() { " [+]" } else { "" };
+        lines.push(format!("{marker} {}: {}{}", i + 1, d.buf.path.display(), dirty));
+    }
+    app.output_lines = lines;
+    app.side_tab = SideTab::Output;
+    app.side_scroll = 0;
+}
+
 fn cmd_export(app: &mut App, args: &[&str]) {
     let Some(out) = args.first() else {
         app.message = "usage: :export <report.json>".into();
@@ -248,9 +319,11 @@ bx commands:
   :loadstructs <file.bxs>       load struct definitions
   :diff <file> / :diffoff       side-by-side diff (n/N jump hunks)
   :xor / :cyclic                analyze last visual selection (also x / c)
+  :checksum [start end]         CRC/MD5/SHA of selection or file (also #)
   :export <file.json>           JSON report of annotations
-  :w [file] | :q | :q! | :wq    write / quit
-  :info | :entropy | :help      side-pane tabs
+  files: :e <f> open · :bn/:bp/:b<n> switch · :ls list · :close · gt/gT
+  :w [file] | :q | :q! | :wq | :qa    write / quit
+  :info | :inspect | :entropy | :help   side-pane tabs
 keys: hjkl move · v select · i edit (Tab hex/ascii) · u undo · C-r redo
       / search ('?? '=wildcard, \"text\"=string) · n/N next/prev · {/} magic hits
-      Tab cycle side pane · J/K scroll · </>/< resize · e entropy";
+      Tab cycle side pane · J/K scroll · >/< resize · # checksum · e entropy";

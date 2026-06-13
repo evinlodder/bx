@@ -1,13 +1,19 @@
 //! Application state and vim-style key handling.
+//!
+//! Per-file state lives in [`Document`]; [`App`] owns a stack of open documents
+//! plus global UI state (mode, command line, side-pane tab) and derefs to the
+//! active document so the rest of the code can keep saying `app.buf` etc.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::analysis::arch::{self, ArchHit};
 use crate::analysis::magic::{self, MagicHit};
-use crate::analysis::{cyclic, entropy, headers, xor};
+use crate::analysis::{checksum, cyclic, entropy, headers, xor};
 use crate::annotations::{self, Region};
 use crate::buffer::FileBuffer;
 use crate::config::Config;
@@ -31,6 +37,7 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SideTab {
     Marks,
+    Inspect,
     Analysis,
     Entropy,
     Output,
@@ -39,7 +46,8 @@ pub enum SideTab {
 impl SideTab {
     pub fn next(self) -> Self {
         match self {
-            Self::Marks => Self::Analysis,
+            Self::Marks => Self::Inspect,
+            Self::Inspect => Self::Analysis,
             Self::Analysis => Self::Entropy,
             Self::Entropy => Self::Output,
             Self::Output => Self::Marks,
@@ -51,8 +59,8 @@ impl SideTab {
 const XOR_CAP: usize = 1 << 20;
 const CYCLIC_CAP: usize = 4 << 20;
 
-pub struct App {
-    pub config: Config,
+/// Everything tied to one open file.
+pub struct Document {
     pub buf: FileBuffer,
     pub diff_buf: Option<FileBuffer>,
     pub diff_hunks: Vec<Hunk>,
@@ -67,30 +75,19 @@ pub struct App {
     pub file_info: FileInfo,
     pub cursor: u64,
     pub view_top: u64,
-    /// Hex rows visible last frame; the UI updates this during draw.
-    pub view_rows: usize,
-    pub mode: Mode,
     /// Waiting for the low nibble of a hex edit.
     pub nibble_low: bool,
     pub visual_anchor: Option<u64>,
     pub last_selection: Option<(u64, u64)>,
-    /// Accumulated hex digits of a `g<hex>g` seek, if a `g` is pending.
-    pub pending_g: Option<String>,
-    pub cmdline: String,
-    pub message: String,
     pub output_lines: Vec<String>,
-    pub side_tab: SideTab,
-    pub side_scroll: u16,
     /// Bucketed whole-file entropy, keyed by bucket count (pane height).
     pub entropy_cache: Option<(usize, Vec<(u64, f64)>)>,
-    pub quit: bool,
 }
 
-impl App {
-    pub fn new(path: &Path, config: Config) -> Result<Self, String> {
+impl Document {
+    pub fn open(path: &Path) -> Result<Self, String> {
         let buf = FileBuffer::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut app = Self {
-            config,
+        let mut doc = Self {
             buf,
             diff_buf: None,
             diff_hunks: Vec::new(),
@@ -110,30 +107,24 @@ impl App {
             },
             cursor: 0,
             view_top: 0,
-            view_rows: 24,
-            mode: Mode::Normal,
             nibble_low: false,
             visual_anchor: None,
             last_selection: None,
-            pending_g: None,
-            cmdline: String::new(),
-            message: String::new(),
             output_lines: Vec::new(),
-            side_tab: SideTab::Analysis,
-            side_scroll: 0,
             entropy_cache: None,
-            quit: false,
         };
-        app.reanalyze();
-        app.load_sidecars();
-        app.message = format!(
-            "{} | {} bytes | {} | H={:.2}",
-            path.display(),
-            app.file_info.size,
-            app.file_info.detected_type,
-            app.file_info.entropy
-        );
-        Ok(app)
+        doc.reanalyze();
+        doc.load_sidecars();
+        Ok(doc)
+    }
+
+    /// Short name for the file-tab strip.
+    pub fn title(&self) -> String {
+        self.buf
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "?".into())
     }
 
     /// Whole-file passes: hash, entropy, magic scan, arch heuristics, headers.
@@ -192,6 +183,196 @@ impl App {
                 Err(e) => self.output_lines.push(format!("bxs parse failed: {e}")),
             }
         }
+    }
+
+    /// File info + analysis summary; feeds the Analysis tab and --batch mode.
+    pub fn info_lines(&self) -> Vec<String> {
+        let mut out = vec![
+            format!("file: {}", self.buf.path.display()),
+            format!(
+                "size: {} (0x{:X})",
+                self.file_info.size, self.file_info.size
+            ),
+            format!("type: {}", self.file_info.detected_type),
+            format!("entropy: {:.4} bits/byte", self.file_info.entropy),
+            format!("md5: {}", self.file_info.md5),
+            String::new(),
+            format!(
+                "magic hits: {}{}",
+                self.magic_hits.len(),
+                if self.magic_truncated {
+                    " (truncated)"
+                } else {
+                    ""
+                }
+            ),
+        ];
+        for h in self.magic_hits.iter().take(200) {
+            out.push(format!("  0x{:08X}  {} [{}]", h.offset, h.name, h.category));
+        }
+        if self.magic_hits.len() > 200 {
+            out.push(format!("  … {} more", self.magic_hits.len() - 200));
+        }
+        if !self.header_details.is_empty() {
+            out.push(String::new());
+            out.extend(self.header_details.iter().cloned());
+        }
+        out.push(String::new());
+        out.push(format!(
+            "arch patterns [heuristic]: {} hit(s){}",
+            self.arch_hits.len(),
+            if self.arch_truncated {
+                " (truncated)"
+            } else {
+                ""
+            }
+        ));
+        let mut counts: std::collections::BTreeMap<(&str, &str), usize> =
+            std::collections::BTreeMap::new();
+        for h in &self.arch_hits {
+            *counts.entry((h.arch, h.desc)).or_default() += 1;
+        }
+        for ((arch, desc), n) in counts {
+            out.push(format!("  {arch:<12} {desc:<36} ×{n}"));
+        }
+        out
+    }
+}
+
+pub struct App {
+    pub config: Config,
+    /// Open files; never empty. `active` indexes the focused one.
+    pub docs: Vec<Document>,
+    pub active: usize,
+    /// Hex rows visible last frame; the UI updates this during draw.
+    pub view_rows: usize,
+    pub mode: Mode,
+    /// Accumulated hex digits of a `g<hex>g` seek, if a `g` is pending.
+    pub pending_g: Option<String>,
+    pub cmdline: String,
+    pub message: String,
+    pub side_tab: SideTab,
+    pub side_scroll: u16,
+    pub quit: bool,
+}
+
+impl Deref for App {
+    type Target = Document;
+    fn deref(&self) -> &Document {
+        &self.docs[self.active]
+    }
+}
+
+impl DerefMut for App {
+    fn deref_mut(&mut self) -> &mut Document {
+        &mut self.docs[self.active]
+    }
+}
+
+impl App {
+    pub fn new(path: &Path, config: Config) -> Result<Self, String> {
+        let doc = Document::open(path)?;
+        let mut app = Self {
+            config,
+            docs: vec![doc],
+            active: 0,
+            view_rows: 24,
+            mode: Mode::Normal,
+            pending_g: None,
+            cmdline: String::new(),
+            message: String::new(),
+            side_tab: SideTab::Analysis,
+            side_scroll: 0,
+            quit: false,
+        };
+        app.message = format!(
+            "{} | {} bytes | {} | H={:.2}",
+            path.display(),
+            app.file_info.size,
+            app.file_info.detected_type,
+            app.file_info.entropy
+        );
+        Ok(app)
+    }
+
+    // --- multiple files -------------------------------------------------------
+
+    /// Open another file in a new tab and focus it.
+    pub fn open_file(&mut self, path: &Path) -> Result<(), String> {
+        let doc = Document::open(path)?;
+        self.docs.push(doc);
+        self.active = self.docs.len() - 1;
+        self.enter_file();
+        self.message = format!(
+            "opened {} [{}/{}]",
+            path.display(),
+            self.active + 1,
+            self.docs.len()
+        );
+        Ok(())
+    }
+
+    /// Move focus by `delta` files (wraps).
+    pub fn switch_file(&mut self, delta: isize) {
+        let n = self.docs.len() as isize;
+        if n <= 1 {
+            self.message = "only one file open".into();
+            return;
+        }
+        self.active = (self.active as isize + delta).rem_euclid(n) as usize;
+        self.enter_file();
+        self.message = format!(
+            "[{}/{}] {}",
+            self.active + 1,
+            self.docs.len(),
+            self.buf.path.display()
+        );
+    }
+
+    /// Focus a file by zero-based index, if in range.
+    pub fn goto_file(&mut self, idx: usize) {
+        if idx < self.docs.len() {
+            self.active = idx;
+            self.enter_file();
+            self.message = format!(
+                "[{}/{}] {}",
+                self.active + 1,
+                self.docs.len(),
+                self.buf.path.display()
+            );
+        } else {
+            self.message = format!("no buffer {} (1..{})", idx + 1, self.docs.len());
+        }
+    }
+
+    /// Close the active file; quit the app if it was the last one.
+    pub fn request_close(&mut self, force: bool) {
+        if !force && self.buf.has_unsaved_changes() {
+            self.message = "unsaved changes (:w to save, :q! to discard)".into();
+            return;
+        }
+        if self.docs.len() == 1 {
+            self.quit = true;
+            return;
+        }
+        self.docs.remove(self.active);
+        if self.active >= self.docs.len() {
+            self.active = self.docs.len() - 1;
+        }
+        self.enter_file();
+        self.message = format!(
+            "[{}/{}] {}",
+            self.active + 1,
+            self.docs.len(),
+            self.buf.path.display()
+        );
+    }
+
+    /// Reset transient UI state when the focused file changes.
+    fn enter_file(&mut self) {
+        self.mode = Mode::Normal;
+        self.side_scroll = 0;
+        self.pending_g = None;
     }
 
     pub fn save_annotations(&mut self) {
@@ -284,6 +465,8 @@ impl App {
                         self.message = format!("seek 0x{:X}", self.cursor);
                     }
                 }
+                KeyCode::Char('t') if digits.is_empty() => self.switch_file(1),
+                KeyCode::Char('T') if digits.is_empty() => self.switch_file(-1),
                 KeyCode::Char(c) if c.is_ascii_hexdigit() => {
                     self.pending_g = Some(format!("{digits}{c}"));
                 }
@@ -297,7 +480,7 @@ impl App {
         match key.code {
             KeyCode::Char('g') if !ctrl => {
                 self.pending_g = Some(String::new());
-                self.message = "g…g (hex offset)".into();
+                self.message = "g…g seek · gt/gT switch file".into();
             }
             KeyCode::Char('h') | KeyCode::Left => self.move_cursor(self.cursor.saturating_sub(1)),
             KeyCode::Char('l') | KeyCode::Right => self.move_cursor(self.cursor + 1),
@@ -399,6 +582,14 @@ impl App {
                 }
                 None => self.message = "no selection (use v first)".into(),
             },
+            KeyCode::Char('#') => {
+                let range = self.selection_or_last();
+                if self.mode == Mode::Visual {
+                    self.leave_visual();
+                    self.mode = Mode::Normal;
+                }
+                self.run_checksum(range);
+            }
             KeyCode::Char('m') if self.mode == Mode::Visual => {
                 let (s, e) = self.selection().unwrap();
                 self.leave_visual();
@@ -425,19 +616,14 @@ impl App {
             KeyCode::Char('>') => {
                 self.config.anno_width = (self.config.anno_width + 2).min(120);
             }
-            KeyCode::Char('q') => {
-                if self.buf.has_unsaved_changes() {
-                    self.message = "unsaved changes (:w to save, :q! to discard)".into();
-                } else {
-                    self.quit = true;
-                }
-            }
+            KeyCode::Char('q') => self.request_close(false),
             _ => {}
         }
     }
 
     fn handle_edit(&mut self, key: KeyEvent, ascii: bool) {
         let cols = self.columns();
+        let at = self.cursor;
         match key.code {
             KeyCode::Esc => {
                 self.buf.commit_group();
@@ -454,25 +640,24 @@ impl App {
                     "-- EDIT (ascii) --".into()
                 };
             }
-            KeyCode::Left => self.move_cursor(self.cursor.saturating_sub(1)),
-            KeyCode::Right => self.move_cursor(self.cursor + 1),
-            KeyCode::Down => self.move_cursor(self.cursor + cols),
-            KeyCode::Up => self.move_cursor(self.cursor.saturating_sub(cols)),
-            KeyCode::Backspace => self.move_cursor(self.cursor.saturating_sub(1)),
+            KeyCode::Left => self.move_cursor(at.saturating_sub(1)),
+            KeyCode::Right => self.move_cursor(at + 1),
+            KeyCode::Down => self.move_cursor(at + cols),
+            KeyCode::Up => self.move_cursor(at.saturating_sub(cols)),
+            KeyCode::Backspace => self.move_cursor(at.saturating_sub(1)),
             KeyCode::Char(c) => {
                 if ascii {
                     if (' '..='~').contains(&c) {
-                        self.buf.set(self.cursor, c as u8);
-                        self.move_cursor(self.cursor + 1);
+                        self.buf.set(at, c as u8);
+                        self.move_cursor(at + 1);
                     }
                 } else if let Some(d) = c.to_digit(16) {
-                    let cur = self.buf.get(self.cursor).unwrap_or(0);
+                    let cur = self.buf.get(at).unwrap_or(0);
                     if self.nibble_low {
-                        self.buf.set(self.cursor, cur & 0xF0 | d as u8);
-                        let next = self.cursor + 1;
-                        self.move_cursor(next); // resets nibble_low
+                        self.buf.set(at, cur & 0xF0 | d as u8);
+                        self.move_cursor(at + 1); // resets nibble_low
                     } else {
-                        self.buf.set(self.cursor, (d as u8) << 4 | cur & 0x0F);
+                        self.buf.set(at, (d as u8) << 4 | cur & 0x0F);
                         self.nibble_low = true;
                     }
                 }
@@ -538,10 +723,11 @@ impl App {
     /// n/N: diff hunks while a diff is loaded, else search hits.
     fn nav_next(&mut self, forward: bool) {
         if self.diff_buf.is_some() {
+            let from = self.cursor;
             let h = if forward {
-                diff::next_hunk(&self.diff_hunks, self.cursor)
+                diff::next_hunk(&self.diff_hunks, from)
             } else {
-                diff::prev_hunk(&self.diff_hunks, self.cursor)
+                diff::prev_hunk(&self.diff_hunks, from)
             };
             match h {
                 Some(h) => {
@@ -552,10 +738,11 @@ impl App {
                 None => self.message = "no diff hunks".into(),
             }
         } else {
+            let from = self.cursor;
             let hit = if forward {
-                self.search.next(self.cursor)
+                self.search.next(from)
             } else {
-                self.search.prev(self.cursor)
+                self.search.prev(from)
             };
             match hit {
                 Some((s, _)) => {
@@ -576,16 +763,17 @@ impl App {
             self.message = "no magic hits".into();
             return;
         }
+        let cursor = self.cursor;
         let hit = if forward {
             self.magic_hits
                 .iter()
-                .find(|h| h.offset > self.cursor)
+                .find(|h| h.offset > cursor)
                 .or(self.magic_hits.first())
         } else {
             self.magic_hits
                 .iter()
                 .rev()
-                .find(|h| h.offset < self.cursor)
+                .find(|h| h.offset < cursor)
                 .or(self.magic_hits.last())
         };
         if let Some(h) = hit {
@@ -649,6 +837,33 @@ impl App {
         self.message = format!("{} cyclic candidate(s)", hits.len());
     }
 
+    /// Compute checksums over a byte range (or the whole file if `range` is
+    /// None) and show them in the Output tab.
+    pub fn run_checksum(&mut self, range: Option<(u64, u64)>) {
+        let label = match range {
+            Some((s, e)) => format!("selection 0x{s:X}..0x{e:X}"),
+            None => "whole file".to_string(),
+        };
+        let (n, results) = {
+            let bytes: Cow<[u8]> = match range {
+                Some((s, e)) => Cow::Owned(self.buf.get_range(s, (e - s) as usize)),
+                None if self.buf.has_unsaved_changes() => {
+                    Cow::Owned(self.buf.get_range(0, self.buf.len() as usize))
+                }
+                None => Cow::Borrowed(self.buf.raw()),
+            };
+            (bytes.len(), checksum::all(&bytes))
+        };
+        let mut lines = vec![format!("Checksums — {label} ({n} bytes):")];
+        for (name, val) in results {
+            lines.push(format!("  {name:<8} {val}"));
+        }
+        self.output_lines = lines;
+        self.side_tab = SideTab::Output;
+        self.side_scroll = 0;
+        self.message = format!("checksums computed ({n} bytes)");
+    }
+
     pub fn start_diff(&mut self, path: &Path) -> Result<(), String> {
         let other = FileBuffer::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         self.diff_hunks = diff::compute(self.buf.raw(), other.raw(), 4);
@@ -656,58 +871,5 @@ impl App {
         self.diff_buf = Some(other);
         self.message = format!("diff: {n} hunk(s) | n/N to jump, :diffoff to close");
         Ok(())
-    }
-
-    /// File info + analysis summary; feeds the Analysis tab and --batch mode.
-    pub fn info_lines(&self) -> Vec<String> {
-        let mut out = vec![
-            format!("file: {}", self.buf.path.display()),
-            format!(
-                "size: {} (0x{:X})",
-                self.file_info.size, self.file_info.size
-            ),
-            format!("type: {}", self.file_info.detected_type),
-            format!("entropy: {:.4} bits/byte", self.file_info.entropy),
-            format!("md5: {}", self.file_info.md5),
-            String::new(),
-            format!(
-                "magic hits: {}{}",
-                self.magic_hits.len(),
-                if self.magic_truncated {
-                    " (truncated)"
-                } else {
-                    ""
-                }
-            ),
-        ];
-        for h in self.magic_hits.iter().take(200) {
-            out.push(format!("  0x{:08X}  {} [{}]", h.offset, h.name, h.category));
-        }
-        if self.magic_hits.len() > 200 {
-            out.push(format!("  … {} more", self.magic_hits.len() - 200));
-        }
-        if !self.header_details.is_empty() {
-            out.push(String::new());
-            out.extend(self.header_details.iter().cloned());
-        }
-        out.push(String::new());
-        out.push(format!(
-            "arch patterns [heuristic]: {} hit(s){}",
-            self.arch_hits.len(),
-            if self.arch_truncated {
-                " (truncated)"
-            } else {
-                ""
-            }
-        ));
-        let mut counts: std::collections::BTreeMap<(&str, &str), usize> =
-            std::collections::BTreeMap::new();
-        for h in &self.arch_hits {
-            *counts.entry((h.arch, h.desc)).or_default() += 1;
-        }
-        for ((arch, desc), n) in counts {
-            out.push(format!("  {arch:<12} {desc:<36} ×{n}"));
-        }
-        out
     }
 }
