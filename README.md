@@ -1,0 +1,161 @@
+# bx
+
+A terminal binary analysis tool for reverse engineers: vim-style hex
+viewer/editor with annotations, struct templates, diffing, entropy
+visualization, XOR brute-forcing, magic-byte scanning, and heuristic
+architecture detection. Built for firmware blobs — files are memory-mapped,
+so multi-hundred-MB images open instantly and navigation stays smooth.
+
+```
+┌ fw.bin ───────────────────────────────────────────────┐┌───────────────────────────┐
+│00000000  41 4E 44 52 4F 49 44 21  00 00 80 00  ANDROID!││ Marks │ Analysis │ … │   │
+│00000010  00 00 20 00 00 00 00 00  00 00 00 00  ·· ·····││ bhdr.kernel_size u32le    │
+│…                                                       ││   = 8388608 (0x800000)    │
+└────────────────────────────────────────────────────────┘└───────────────────────────┘
+ NORMAL  0x0/0x1A9F  Android boot image | H=3.62 | md5 748bb902c38d
+```
+
+## Install
+
+```sh
+cargo install --path .
+# or just
+cargo build --release   # binary at target/release/bx
+```
+
+Pure-cargo dependencies only (ratatui, crossterm, memmap2, md5, serde).
+
+## Usage
+
+```sh
+bx file.bin              # open in the TUI
+bx a.bin b.bin           # open with a side-by-side diff
+bx file.bin --batch      # headless: print file info, magic hits, parsed
+                         # headers and arch summary to stdout, then exit
+```
+
+On load, bx computes the file's size, MD5, Shannon entropy and detected type,
+scans the **entire file** for magic signatures (embedded images included), and
+runs the heuristic architecture pattern scan. Results land in the **Analysis**
+tab of the side pane.
+
+## Keys (vim-style)
+
+| Key | Action |
+|---|---|
+| `h j k l` / arrows | move by byte / row |
+| `w` / `b` | row forward / back |
+| `0` / `$` | start / end of row |
+| `Ctrl-d` / `Ctrl-u` | half page down / up |
+| `Ctrl-f` / `Ctrl-b`, PgDn / PgUp | full page |
+| `gg` / `G` | start / end of file |
+| `g<hex>g` | seek to hex offset (e.g. `g1845g`) |
+| `/` | search — hex with wildcards (`de ad ?? ef`) or string (`"text"`, matches ASCII **and** UTF-16LE) |
+| `n` / `N` | next / prev search hit (or diff hunk while a diff is open) |
+| `{` / `}` | prev / next magic-byte hit |
+| `v` | visual selection (movement extends; `Esc`/`v` ends) |
+| `m` (in visual) | pre-fill `:mark` for the selection |
+| `x` | XOR brute-force the selection (keys 0x00–0xFF, printable hits ranked) |
+| `c` | cyclic / repeating-structure detection on the selection |
+| `i` | edit mode — type hex nibbles; `Tab` switches to ASCII overtype; `Esc` ends |
+| `u` / `Ctrl-r` | undo / redo (grouped per edit session) |
+| `e` | toggle entropy graph |
+| `Tab` | cycle side-pane tab (Marks → Analysis → Entropy → Output) |
+| `J` / `K` | scroll side pane |
+| `q` | quit (refuses if unsaved; `:q!` discards) |
+
+## Commands
+
+```
+:seek <target>            jump to 0x<hex>, bare hex, 0d<decimal>, or a mark label
+:mark <start> <end> <label> <type>   annotate [start,end) — types: u8 u16le u16be
+                                     u32le u32be u64le u64be float str raw
+:unmark <label>
+:applystruct <name>       lay a struct template down at the cursor
+:loadstructs <file.bxs>   load extra struct definitions
+:diff <file> / :diffoff   side-by-side diff; changed/added/removed colored
+:xor / :cyclic            analyze the last visual selection
+:export <report.json>     JSON report: file info + annotations with parsed values
+:w [file]                 write patches in place, or a patched copy to [file]
+:q  :q!  :wq              quit / force quit / write+quit
+:info :entropy :help      switch side-pane tabs
+```
+
+## Annotations (`.bxa`)
+
+Marks are saved automatically to a JSON sidecar `<binary>.bxa` and reloaded
+next session (with an MD5 mismatch warning if the file changed). The Marks tab
+shows each region's **live** decoded value — it re-decodes through your
+unsaved edits. Annotated bytes are color-coded in the hex view, and labels
+work as `:seek` targets.
+
+## Struct templates (`.bxs`)
+
+C-like definitions, auto-loaded from `<binary>.bxs`:
+
+```c
+struct boot_hdr {
+    str magic[8];
+    u32le kernel_size;
+    u32le kernel_addr;
+    raw reserved[16];     // fixed-size types take no [len]
+    u16le flags[4];       // arrays of scalars are sized automatically
+}
+```
+
+`:applystruct boot_hdr` at the cursor annotates every field
+(`boot_hdr.kernel_size`, …) with parsed values.
+
+## Analysis
+
+- **Magic scan** — executables (ELF, PE/MZ, Mach-O incl. fat, COFF, ar, DEX
+  035–039, ODEX, VDEX, OAT, ART), firmware (Android boot/vendor_boot, uImage,
+  FIT/DTB, SquashFS ×4, JFFS2, UBI/UBIFS, YAFFS2, cramfs, romfs, ext2/3/4,
+  F2FS), archives (gzip, zlib ×4, LZMA, LZ4, zstd, bzip2, XZ, 7z, ZIP, RAR,
+  tar), crypto (DER x509 / PKCS#8 / PKCS#12, PEM banners, OpenSSH keys,
+  Android OTA payload), media (PNG, JPEG, BMP, SQLite3, protobuf/msgpack
+  heuristics). Short magics carry validators (e.g. MZ → e_lfanew → `PE\0\0`,
+  tar checksum field, ext superblock sanity) to keep firmware noise down;
+  noisy entries are capped per type and flagged as truncated.
+- **Header parsing** — ELF (class/endian, machine, entry, phoff, section
+  count), PE (machine, entrypoint RVA, section table), Android boot image
+  v0–v4 (full field set per version), DEX (version, checksum, class count) —
+  parsed wherever the magic lands, so embedded images decode too.
+- **Arch patterns** *(heuristic, no disassembly — labeled as such)* —
+  prologue/epilogue signatures for x86/x86_64, ARM32 (ARM+Thumb), ARM64,
+  MIPS (LE/BE), PowerPC, RISC-V, plus NOP sleds, `int3` runs and zero-fill
+  padding. Matches are tinted in the hex view (padding dimmed).
+- **Entropy** — whole-file value in the status bar; per-region bar graph in
+  the Entropy tab (red ≈ compressed/encrypted), cursor position highlighted.
+- **XOR brute force** — select a region, press `x`; all 256 keys tried,
+  candidates ranked by printability/text-likeness with decoded previews.
+- **Cyclic detection** — select a region, press `c`; reports repeating record
+  periods (2–64 bytes) by self-similarity.
+
+## Editing model
+
+Overwrite-only by design: insertion would shift offsets and silently
+invalidate annotations and diffs, which is the wrong default for binary
+patching. Edits live in an overlay (the mapped file is untouched) until `:w`
+patches the file in place or `:w copy.bin` writes a patched copy. Modified
+bytes are highlighted; undo/redo is unlimited. Diff mode compares on-disk
+contents.
+
+## Config (`~/.bxrc`)
+
+`key = value` lines, `#` comments:
+
+```ini
+columns = 16            # bytes per hex row (1-64)
+anno_pane = right       # right | left | off
+anno_width = 44
+color.annotation = cyan        # named colors or #rrggbb
+color.cursor = yellow
+color.selection = blue
+color.search = green
+color.diff_changed = yellow
+color.diff_added = green
+color.diff_removed = red
+color.heuristic = magenta
+color.modified = lightred
+```

@@ -1,0 +1,18 @@
+[package]
+name = "bx"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal binary analysis tool: vim-style hex viewer/editor with annotations, diffing, and firmware-oriented heuristics"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+memmap2 = "0.9"
+md5 = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
