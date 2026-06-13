@@ -5,7 +5,7 @@
 //! active document so the rest of the code can keep saying `app.buf` etc.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
@@ -20,7 +20,7 @@ use crate::config::Config;
 use crate::diff::{self, Hunk};
 use crate::export::FileInfo;
 use crate::search::SearchState;
-use crate::structs::StructDef;
+use crate::structs::Template;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -39,6 +39,7 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SideTab {
     Marks,
+    Template,
     Inspect,
     Strings,
     Analysis,
@@ -47,15 +48,27 @@ pub enum SideTab {
 }
 
 impl SideTab {
+    /// Display order, for the tab strip and next/prev cycling.
+    pub const ORDER: [SideTab; 7] = [
+        Self::Marks,
+        Self::Template,
+        Self::Inspect,
+        Self::Strings,
+        Self::Analysis,
+        Self::Entropy,
+        Self::Output,
+    ];
+
+    fn index(self) -> usize {
+        Self::ORDER.iter().position(|&t| t == self).unwrap_or(0)
+    }
+
     pub fn next(self) -> Self {
-        match self {
-            Self::Marks => Self::Inspect,
-            Self::Inspect => Self::Strings,
-            Self::Strings => Self::Analysis,
-            Self::Analysis => Self::Entropy,
-            Self::Entropy => Self::Output,
-            Self::Output => Self::Marks,
-        }
+        Self::ORDER[(self.index() + 1) % Self::ORDER.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        Self::ORDER[(self.index() + Self::ORDER.len() - 1) % Self::ORDER.len()]
     }
 }
 
@@ -69,7 +82,7 @@ pub struct Document {
     pub diff_buf: Option<FileBuffer>,
     pub diff_hunks: Vec<Hunk>,
     pub annotations: Vec<Region>,
-    pub structs: HashMap<String, StructDef>,
+    pub template: Template,
     pub search: SearchState,
     pub magic_hits: Vec<MagicHit>,
     pub magic_truncated: bool,
@@ -101,6 +114,8 @@ pub struct Document {
     pub strings_utf16: bool,
     /// Case-insensitive substring filter applied to the Strings tab.
     pub strings_filter: String,
+    /// Paths of collapsed groups in the Marks tree.
+    pub collapsed: HashSet<String>,
 }
 
 impl Document {
@@ -111,7 +126,7 @@ impl Document {
             diff_buf: None,
             diff_hunks: Vec::new(),
             annotations: Vec::new(),
-            structs: HashMap::new(),
+            template: Template::default(),
             search: SearchState::default(),
             magic_hits: Vec::new(),
             magic_truncated: false,
@@ -141,6 +156,7 @@ impl Document {
             strings_min: 4,
             strings_utf16: false,
             strings_filter: String::new(),
+            collapsed: HashSet::new(),
         };
         doc.reanalyze();
         doc.detect_ptr_defaults();
@@ -220,7 +236,7 @@ impl Document {
         };
         if let Ok(text) = std::fs::read_to_string(&bxs) {
             match crate::structs::parse(&text) {
-                Ok(map) => self.structs.extend(map),
+                Ok(tpl) => self.template.merge(tpl),
                 Err(e) => self.output_lines.push(format!("bxs parse failed: {e}")),
             }
         }
@@ -292,6 +308,8 @@ pub struct App {
     pub pending_g: Option<String>,
     /// Awaiting a bookmark key: `Some(true)` to set, `Some(false)` to jump.
     pub pending_mark: Option<bool>,
+    /// Awaiting a fold command after `z`.
+    pub pending_z: bool,
     pub cmdline: String,
     pub message: String,
     pub side_tab: SideTab,
@@ -323,6 +341,7 @@ impl App {
             mode: Mode::Normal,
             pending_g: None,
             pending_mark: None,
+            pending_z: false,
             cmdline: String::new(),
             message: String::new(),
             side_tab: SideTab::Analysis,
@@ -418,6 +437,7 @@ impl App {
         self.side_scroll = 0;
         self.pending_g = None;
         self.pending_mark = None;
+        self.pending_z = false;
     }
 
     pub fn save_annotations(&mut self) {
@@ -503,6 +523,25 @@ impl App {
     }
 
     fn handle_normal(&mut self, key: KeyEvent) {
+        // A pending fold command (after `z`) consumes the next key.
+        if self.pending_z {
+            self.pending_z = false;
+            self.side_tab = SideTab::Marks;
+            self.side_scroll = 0;
+            match key.code {
+                KeyCode::Char('a') => self.fold_toggle(),
+                KeyCode::Char('R') => {
+                    self.collapsed.clear();
+                    self.message = "expanded all folds".into();
+                }
+                KeyCode::Char('M') => {
+                    self.collapse_all();
+                    self.message = "collapsed all folds".into();
+                }
+                _ => self.message.clear(),
+            }
+            return;
+        }
         // A pending bookmark key (after `m` or `` ` ``) consumes the next char.
         if let Some(set) = self.pending_mark.take() {
             match key.code {
@@ -699,6 +738,14 @@ impl App {
             KeyCode::Tab => {
                 self.side_tab = self.side_tab.next();
                 self.side_scroll = 0;
+            }
+            KeyCode::BackTab => {
+                self.side_tab = self.side_tab.prev();
+                self.side_scroll = 0;
+            }
+            KeyCode::Char('z') => {
+                self.pending_z = true;
+                self.message = "z: a toggle fold · R expand all · M collapse all".into();
             }
             KeyCode::Char('J') => self.side_scroll = self.side_scroll.saturating_add(1),
             KeyCode::Char('K') => self.side_scroll = self.side_scroll.saturating_sub(1),
@@ -954,6 +1001,37 @@ impl App {
         self.side_tab = SideTab::Output;
         self.side_scroll = 0;
         self.message = format!("checksums computed ({n} bytes)");
+    }
+
+    // --- Marks tree folding ---------------------------------------------------
+
+    /// Toggle the fold containing the cursor (vim `za`).
+    fn fold_toggle(&mut self) {
+        let forest = crate::marks::build(&self.annotations);
+        match crate::marks::fold_target(&forest, &self.collapsed, self.cursor) {
+            Some(path) => {
+                if self.collapsed.remove(&path) {
+                    self.message = format!("expand {path}");
+                } else {
+                    self.collapsed.insert(path.clone());
+                    self.message = format!("collapse {path}");
+                }
+            }
+            None => self.message = "no fold at cursor".into(),
+        }
+    }
+
+    /// Collapse every group, including top-level structs (vim `zM`).
+    fn collapse_all(&mut self) {
+        let forest = crate::marks::build(&self.annotations);
+        self.collapsed = crate::marks::group_paths(&forest, 0).into_iter().collect();
+    }
+
+    /// Collapse arrays and nested structs but leave top-level structs open.
+    /// Called after `:applystruct` so a fresh parse reads as a tidy tree.
+    pub fn autocollapse_marks(&mut self) {
+        let forest = crate::marks::build(&self.annotations);
+        self.collapsed = crate::marks::group_paths(&forest, 1).into_iter().collect();
     }
 
     pub fn start_diff(&mut self, path: &Path) -> Result<(), String> {

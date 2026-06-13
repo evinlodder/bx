@@ -7,6 +7,7 @@ mod config;
 mod diff;
 mod export;
 mod inspector;
+mod marks;
 mod search;
 mod structs;
 mod ui;

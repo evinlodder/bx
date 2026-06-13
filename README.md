@@ -75,7 +75,8 @@ tab of the side pane.
 | `i` | edit mode — type hex nibbles; `Tab` switches to ASCII overtype; `Esc` ends |
 | `u` / `Ctrl-r` | undo / redo (grouped per edit session) |
 | `e` | toggle entropy graph |
-| `Tab` | cycle side-pane tab (Marks → Inspect → Strings → Analysis → Entropy → Output) |
+| `za` / `zR` / `zM` | toggle fold at cursor / expand all / collapse all (Marks tree) |
+| `Tab` / `Shift-Tab` | next / previous side-pane tab (the header is a scrolling carousel) |
 | `J` / `K` | scroll side pane |
 | `q` | quit / close active file (refuses if unsaved; `:q!` discards) |
 
@@ -117,20 +118,56 @@ and labels work as `:seek` targets.
 
 ## Struct templates (`.bxs`)
 
-C-like definitions, auto-loaded from `<binary>.bxs`:
+A small C-like template language, auto-loaded from `<binary>.bxs` (or
+`:loadstructs <file>`). Simple cases stay simple — a flat list of typed
+fields — but it has the pieces you need to parse real formats:
+
+- **scalars** — `u8 u16le u16be u32le u32be u64le u64be`, `f32`/`f64`,
+  `str[n]` (string), `raw[n]` (blob)
+- **nested structs** — use another struct's name as a field type
+- **dynamic arrays** — `Item items[count];` sized by an *earlier field*, with
+  expressions (`data[len * 2 + 4]`)
+- **enums** — `enum Kind : u8 { FILE = 1, DIR = 2 }` annotate a field with its
+  variant name
+- **bitfields** — `bitfield Perm : u8 { read:1, write:1, exec:1, pad:5 }`
+  decode a value into named bit groups (LSB first)
+- **conditionals** — `if (flag == 1) { … } else { … }` for optional fields
+  (full expression operators: `+ - * / %  == != < <= > >=  && ||  & | ^ ~ << >>`)
 
 ```c
-struct boot_hdr {
-    str magic[8];
-    u32le kernel_size;
-    u32le kernel_addr;
-    raw reserved[16];     // fixed-size types take no [len]
-    u16le flags[4];       // arrays of scalars are sized automatically
+enum Kind : u8 { FILE = 1, DIR = 2 }
+bitfield Perm : u8 { read:1, write:1, exec:1, pad:5 }
+
+struct Entry {
+    Kind  kind;
+    Perm  perm;
+    u8    name_len;
+    str   name[name_len];   // length-prefixed string
+}
+
+struct Header {
+    str    magic[4];
+    u32le  count;
+    Entry  entries[count];  // array sized by a prior field
 }
 ```
 
-`:applystruct boot_hdr` at the cursor annotates every field
-(`boot_hdr.kernel_size`, …) with parsed values.
+`:applystruct Header` at the cursor walks the actual bytes and annotates every
+field — nested labels like `Header.entries[0].name`, enum fields show their
+variant name, bitfields show each group's value. (The original flat syntax
+still works unchanged.)
+
+The **Marks** tab renders the result as a **collapsible tree** with
+indentation; nested structs and arrays are auto-collapsed so you see the shape
+first, then drill in with `za` (toggle the fold at the cursor), `zR` (expand
+all) and `zM` (collapse all). The **Template** tab (`:template`) shows the
+loaded `.bxs` definitions, so you don't have to remember what's in the file.
+
+Handy extras: `:applystruct <name> <offset>` applies at a hex offset or mark
+label without seeking first (e.g. `:applystruct Phdr e_phoff`); re-applying a
+struct clears its old fields first (no orphans), and `:unmark <name>` removes a
+whole applied struct. Edit the `.bxs` and `:reloadstructs` to pick up changes
+without restarting. Parse errors report the source line (`ls.bxs:line 3: …`).
 
 ## Analysis
 

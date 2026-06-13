@@ -55,6 +55,7 @@ pub fn execute(app: &mut App, line: &str) {
         }
         "applystruct" => cmd_applystruct(app, &args),
         "loadstructs" => cmd_loadstructs(app, &args),
+        "reloadstructs" | "reload" => cmd_reload(app),
         "export" => cmd_export(app, &args),
         "checksum" | "cksum" | "hash" => cmd_checksum(app, &args),
         "follow" => cmd_follow(app, &args),
@@ -116,6 +117,10 @@ pub fn execute(app: &mut App, line: &str) {
         }
         "inspect" => {
             app.side_tab = SideTab::Inspect;
+            app.side_scroll = 0;
+        }
+        "template" | "defs" | "schema" => {
+            app.side_tab = SideTab::Template;
             app.side_scroll = 0;
         }
         "entropy" => {
@@ -191,6 +196,7 @@ fn cmd_mark(app: &mut App, args: &[&str]) {
         end,
         label: label.clone(),
         rtype,
+        note: None,
     });
     app.annotations.sort_by_key(|r| r.start);
     app.save_annotations();
@@ -198,16 +204,25 @@ fn cmd_mark(app: &mut App, args: &[&str]) {
     app.message = format!("marked {label} @ 0x{start:X}..0x{end:X}");
 }
 
+/// True if `label` is `ns` itself or a field/element beneath it, e.g.
+/// `Elf64` matches `Elf64`, `Elf64.magic`, `Elf64.phdrs[0].p_type`.
+fn in_namespace(label: &str, ns: &str) -> bool {
+    label == ns
+        || label.starts_with(&format!("{ns}."))
+        || label.starts_with(&format!("{ns}["))
+}
+
 fn cmd_unmark(app: &mut App, args: &[&str]) {
     let Some(label) = args.first() else {
-        app.message = "usage: :unmark <label>".into();
+        app.message = "usage: :unmark <label>  (also removes a struct's fields)".into();
         return;
     };
     let before = app.annotations.len();
-    app.annotations.retain(|r| &r.label != label);
-    if app.annotations.len() < before {
+    app.annotations.retain(|r| !in_namespace(&r.label, label));
+    let removed = before - app.annotations.len();
+    if removed > 0 {
         app.save_annotations();
-        app.message = format!("unmarked {label}");
+        app.message = format!("unmarked {removed} region(s) under '{label}'");
     } else {
         app.message = format!("no annotation '{label}'");
     }
@@ -215,29 +230,48 @@ fn cmd_unmark(app: &mut App, args: &[&str]) {
 
 fn cmd_applystruct(app: &mut App, args: &[&str]) {
     let Some(name) = args.first() else {
-        let known: Vec<&str> = app.structs.keys().map(String::as_str).collect();
-        app.message = format!("usage: :applystruct <name>; loaded: {}", known.join(", "));
+        let mut known = app.template.struct_names();
+        known.sort_unstable();
+        app.message = format!(
+            "usage: :applystruct <name> [offset]; loaded: {}",
+            known.join(", ")
+        );
         return;
     };
-    let Some(def) = app.structs.get(*name) else {
+    if !app.template.has_struct(name) {
         app.message = format!("no struct '{name}' (load via <file>.bxs or :loadstructs)");
         return;
+    }
+    // Optional second arg: apply at a hex offset / decimal / mark label.
+    let at = match args.get(1) {
+        None => app.cursor,
+        Some(s) => match parse_offset(s, &app.annotations) {
+            Some(o) if o < app.buf.len() => o,
+            Some(o) => {
+                app.message = format!("0x{o:X} is past EOF (size 0x{:X})", app.buf.len());
+                return;
+            }
+            None => {
+                app.message = format!("can't parse offset or label '{s}'");
+                return;
+            }
+        },
     };
-    let total = def.total_size();
-    if app.cursor + total > app.buf.len() {
-        app.message = format!("struct {name} (0x{total:X} bytes) overruns EOF at cursor");
-        return;
-    }
-    let regions = def.apply(app.cursor);
+    let (regions, warn) = app.template.apply(name, at, &app.buf);
     let n = regions.len();
-    for r in regions {
-        app.annotations.retain(|x| x.label != r.label);
-        app.annotations.push(r);
-    }
+    // Clear the struct's whole namespace first, so a re-apply (e.g. with a
+    // smaller array) never leaves orphan fields behind.
+    app.annotations.retain(|x| !in_namespace(&x.label, name));
+    app.annotations.extend(regions);
     app.annotations.sort_by_key(|r| r.start);
     app.save_annotations();
+    app.autocollapse_marks();
+    app.jump_to(at);
     app.side_tab = SideTab::Marks;
-    app.message = format!("applied {name}: {n} field(s) @ 0x{:X}", app.cursor);
+    app.message = match warn {
+        Some(w) => format!("applied {name}: {n} field(s) @ 0x{at:X} — {w}"),
+        None => format!("applied {name}: {n} field(s) @ 0x{at:X}"),
+    };
 }
 
 fn cmd_loadstructs(app: &mut App, args: &[&str]) {
@@ -247,14 +281,38 @@ fn cmd_loadstructs(app: &mut App, args: &[&str]) {
     };
     match std::fs::read_to_string(file) {
         Ok(text) => match crate::structs::parse(&text) {
-            Ok(map) => {
-                let names: Vec<String> = map.keys().cloned().collect();
-                app.structs.extend(map);
-                app.message = format!("loaded struct(s): {}", names.join(", "));
+            Ok(tpl) => {
+                let mut names = tpl.struct_names();
+                names.sort_unstable();
+                let summary = names.join(", ");
+                app.template.merge(tpl);
+                app.message = format!("loaded: {summary}");
             }
             Err(e) => app.message = format!("{file}: {e}"),
         },
         Err(e) => app.message = format!("{file}: {e}"),
+    }
+}
+
+/// Re-read the `<binary>.bxs` sidecar from scratch (picks up edits, drops
+/// removed definitions). Note: definitions added via `:loadstructs <other>`
+/// are not retained — re-run those if needed.
+fn cmd_reload(app: &mut App) {
+    let mut os = app.buf.path.as_os_str().to_owned();
+    os.push(".bxs");
+    let path = std::path::PathBuf::from(os);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match crate::structs::parse(&text) {
+            Ok(tpl) => {
+                let mut names = tpl.struct_names();
+                names.sort_unstable();
+                let summary = names.join(", ");
+                app.template = tpl;
+                app.message = format!("reloaded {}: {summary}", path.display());
+            }
+            Err(e) => app.message = format!("{}: {e}", path.display()),
+        },
+        Err(e) => app.message = format!("{}: {e}", path.display()),
     }
 }
 
@@ -440,9 +498,9 @@ const HELP: &str = "\
 bx commands:
   :seek <hex|0d<dec>|label>     jump (also g<hex>g, gg, G)
   :mark <start> <end> <label> <type>   annotate region (end exclusive)
-  :unmark <label>               remove annotation
-  :applystruct <name>           lay struct fields down at cursor
-  :loadstructs <file.bxs>       load struct definitions
+  :unmark <label>               remove a mark, or a whole applied struct
+  :applystruct <name> [off]     parse a struct at cursor or offset/label
+  :loadstructs <f> / :reloadstructs   load defs / re-read <file>.bxs after editing
   :diff <file> / :diffoff       side-by-side diff (n/N jump hunks)
   :xor / :cyclic                analyze last visual selection (also x / c)
   :checksum [start end]         CRC/MD5/SHA of selection or file (also #)
@@ -453,8 +511,9 @@ bx commands:
   :export <file.json>           JSON report of annotations
   files: :e <f> open · :bn/:bp/:b<n> switch · :ls list · :close · gt/gT
   :w [file] | :q | :q! | :wq | :qa    write / quit
-  :info | :inspect | :entropy | :help   side-pane tabs
+  :info :template :inspect :entropy :help   side-pane tabs
 keys: hjkl move · v select · i edit · u undo · C-r redo · C-o/C-p jump back/fwd
       m<k> set bookmark · `<k> jump · f/F follow ptr 32/64 · X xrefs-to-here
+      za toggle fold · zR expand all · zM collapse all (Marks tree)
       / search ('?? '=wildcard, \"text\"=string) · n/N next/prev · {/} magic hits
-      Tab cycle side pane · J/K scroll · >/< resize · # checksum · e entropy";
+      Tab/S-Tab cycle side pane · J/K scroll · >/< resize · # checksum · e entropy";

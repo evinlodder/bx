@@ -137,16 +137,46 @@ Milestone B — navigation & xrefs:
 - **Side-tab strip wraps** to multiple rows when too narrow (manual layout;
   ratatui `Tabs` is single-line).
 
+Milestone C — template/struct language v2 (`structs.rs`, the `Template` engine):
+- Replaced the flat `.bxs` parser with a small C-like language (lexer + Pratt
+  expression parser + buffer-aware apply). Backward compatible with flat structs.
+- **Nested structs**, **dynamic arrays** sized by earlier fields with full
+  expressions, **enums** (`enum K : u8 { A=1 }` → field shows variant name),
+  **bitfields** (`bitfield F : u8 { a:1, b:7 }` → LSB-first group breakdown),
+  **`if/else` conditionals**. Operators: + - * / % == != < <= > >= && || & | ^ ~ << >>.
+- `Region` gained an optional `note` field (enum/bitfield decode hint), shown
+  in the Marks tab and JSON export, persisted in `.bxa` (serde default).
+- `:applystruct` walks real bytes; emits nested labels (`Hdr.entries[0].name`),
+  warns on EOF overrun / cap (MAX_REGIONS=8192, MAX_DEPTH=64) but keeps partial.
+- Deliberately NOT included (keep it simple): loops, local vars, typedefs,
+  FSeek/scripting, parent-scope access. Arrays cover repetition.
+
+Milestone C polish (Marks UX + side-pane):
+- **Marks tab is now a collapsible tree** (`marks.rs` builds it from the dotted/
+  indexed labels). Indented by depth; structs/arrays auto-collapse after
+  `:applystruct`. Folds: `za` toggle at cursor, `zR` expand all, `zM` collapse
+  all. Rendering is windowed for speed.
+- **Template side tab** (`:template`/`:defs`) renders the loaded `.bxs`
+  definitions via `Template::describe()`.
+- **Side-pane header is a carousel**: single row, scrolls to keep the active
+  tab centred, clamped (no wrap-around), with `<`/`>` edge indicators.
+  `Tab`/`Shift-Tab` cycle. `SideTab::ORDER` is the single source of order.
+  (Replaced the multi-row wrapping strip.)
+- Workflow extras: `:applystruct <name> [offset|label]` (apply without seeking);
+  re-apply clears the struct namespace first (no orphan marks); `:unmark <name>`
+  removes a whole applied struct; `:reloadstructs` re-reads the `.bxs` sidecar;
+  `.bxs` parse errors carry `line N` (lexer tracks lines). Milestone C complete.
+
 # Roadmap (next thrusts, in recommended order)
 
-1. **Template/struct language v2** — the core "beat 010/ImHex" lever. Nested
-   structs, arrays sized by earlier fields, enums, bitfields, conditionals,
-   pointers. Pure logic, no heavy deps. (Current `.bxs` is flat only.)
-2. **Disassembly pane** — read-only instruction view at the cursor via
+1. **Disassembly pane** — read-only instruction view at the cursor via
    pure-Rust `yaxpeax-*`. The leap from "hex editor" to "RE tool". One curated,
    feature-gated dependency. (Spec said heuristic-only; revisit deliberately.)
-3. **Firmware extraction / transforms** — decompress detected gzip/zlib/lzma/
+2. **Firmware extraction / transforms** — decompress detected gzip/zlib/lzma/
    zstd regions into a new tab; CyberChef-lite transform pipeline
    (XOR/rotate/base64). Optional deps behind a cargo feature.
-4. **Search performance** — replace the naive O(n·m) scan with a memchr-style
+3. **Search performance** — replace the naive O(n·m) scan with a memchr-style
    skip / Boyer-Moore for snappy large-file search.
+4. **Possible template polish** (only if wanted): `:applystruct` cap/depth
+   configurable via `.bxrc`; window the Marks tab for huge applies; a struct
+   browser; `@offset` to apply at a specific address.
