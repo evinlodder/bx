@@ -167,16 +167,36 @@ Milestone C polish (Marks UX + side-pane):
   removes a whole applied struct; `:reloadstructs` re-reads the `.bxs` sidecar;
   `.bxs` parse errors carry `line N` (lexer tracks lines). Milestone C complete.
 
-# Roadmap (next thrusts, in recommended order)
+Milestone D — search performance + transform pipeline:
+- **Faster search** (`search.rs`): replaced the per-byte scan with wildcard-aware
+  **Boyer-Moore-Horspool** (bad-character skip table over the concrete suffix;
+  trailing `??` stripped and re-added to match length; degenerate all-wildcard
+  handled). Overlay-aware. 256MB wildcard search ≈ 320ms. Randomized test
+  cross-checks against a brute-force reference; overlapping matches handled.
+- **Transform pipeline** (`transform.rs` + Transform side tab): CyberChef-style
+  recipe over a selection. Built-in pure-Rust ops (hex/base64/url, xor/add/sub/
+  not/rol/ror, reverse, swap16/32/64, rot13, upper/lower, take/drop, md5/sha1/
+  sha256/crc32). Two custom-transform escape hatches: **`pipe <cmd>`** (streams
+  bytes through any external program via `sh -c`, writer-thread to avoid
+  deadlock) and **named recipes in `~/.bxpipes`** (`name = op | op`). Keys/cmds:
+  `T`/`:transform [name]`, `:t <op>`, `:tpop`, `:tclear`, `:tsave <f>`,
+  `:tpatch` (overwrite output back into the buffer), `:pipelines`. Output cached
+  on edit (never per-frame, since pipe spawns processes); tab shows recipe +
+  hex/ascii + "as text" preview. SideTab order now has 8 entries (Transform
+  after Strings).
+
+# Decisions / scope notes
+- **In-place extraction / decompression is intentionally OUT.** bx is a
+  companion to binwalk (extraction) and ghidra/equivalents (disassembly), not a
+  do-everything tool. `pipe zcat`/`pipe unsquashfs` covers ad-hoc decompression
+  without bundling codecs. (User decision, milestone D.)
+
+# Roadmap (next thrusts — reordered by the user)
 
 1. **Disassembly pane** — read-only instruction view at the cursor via
    pure-Rust `yaxpeax-*`. The leap from "hex editor" to "RE tool". One curated,
    feature-gated dependency. (Spec said heuristic-only; revisit deliberately.)
-2. **Firmware extraction / transforms** — decompress detected gzip/zlib/lzma/
-   zstd regions into a new tab; CyberChef-lite transform pipeline
-   (XOR/rotate/base64). Optional deps behind a cargo feature.
-3. **Search performance** — replace the naive O(n·m) scan with a memchr-style
-   skip / Boyer-Moore for snappy large-file search.
-4. **Possible template polish** (only if wanted): `:applystruct` cap/depth
-   configurable via `.bxrc`; window the Marks tab for huge applies; a struct
-   browser; `@offset` to apply at a specific address.
+   NOTE: keep the "companion, not do-everything" ethos in mind.
+2. **Possible polish** (only if wanted): interactive 3-pane transform overlay
+   (vs current tab); reorder recipe steps; `:applystruct` cap/depth in `.bxrc`;
+   window the Marks tab for huge applies; struct browser.

@@ -10,6 +10,7 @@ mod inspector;
 mod marks;
 mod search;
 mod structs;
+mod transform;
 mod ui;
 
 use std::path::PathBuf;
@@ -57,6 +58,11 @@ fn main() -> ExitCode {
         }
     };
     for w in rc_warnings {
+        app.output_lines.push(w);
+    }
+    let (pipelines, pipe_warnings) = transform::load_pipelines();
+    app.pipelines = pipelines;
+    for w in pipe_warnings {
         app.output_lines.push(w);
     }
     if diff {

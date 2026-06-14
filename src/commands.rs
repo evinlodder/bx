@@ -58,6 +58,20 @@ pub fn execute(app: &mut App, line: &str) {
         "reloadstructs" | "reload" => cmd_reload(app),
         "export" => cmd_export(app, &args),
         "checksum" | "cksum" | "hash" => cmd_checksum(app, &args),
+        "transform" | "tx" => app.start_transform(None, args.first().copied()),
+        "t" => {
+            if args.is_empty() {
+                app.message = "usage: :t <op> [args]  (e.g. :t xor 5a, :t pipe zcat)".into();
+            } else {
+                app.transform_push(&args.join(" "));
+            }
+        }
+        "tpop" => app.transform_pop(),
+        "tclear" => app.transform_clear(),
+        "tsave" => cmd_tsave(app, &args),
+        "tpatch" => cmd_tpatch(app),
+        "pipelines" | "tlist" => cmd_pipelines(app),
+        "reloadpipes" | "pipereload" => cmd_reloadpipes(app),
         "follow" => cmd_follow(app, &args),
         "xref" | "xrefs" => cmd_xref(app, &args),
         "strings" => cmd_strings(app, &args),
@@ -338,6 +352,78 @@ fn cmd_checksum(app: &mut App, args: &[&str]) {
     app.run_checksum(range);
 }
 
+fn cmd_tsave(app: &mut App, args: &[&str]) {
+    let Some(out) = args.first() else {
+        app.message = "usage: :tsave <file>".into();
+        return;
+    };
+    match app.transform_output() {
+        Some(bytes) => match std::fs::write(out, bytes) {
+            Ok(()) => app.message = format!("wrote {} byte(s) to {out}", bytes.len()),
+            Err(e) => app.message = format!("{out}: {e}"),
+        },
+        None => app.message = "no transform output to save (fix the recipe?)".into(),
+    }
+}
+
+/// Overwrite the transform output back into the buffer at the input offset.
+fn cmd_tpatch(app: &mut App) {
+    let Some((start, _)) = app.tx_input else {
+        app.message = "no transform input (press T on a selection)".into();
+        return;
+    };
+    let Some(bytes) = app.transform_output().map(<[u8]>::to_vec) else {
+        app.message = "no transform output to apply".into();
+        return;
+    };
+    let max = app.buf.len().saturating_sub(start) as usize;
+    let n = bytes.len().min(max);
+    for (i, &b) in bytes.iter().take(n).enumerate() {
+        app.buf.set(start + i as u64, b);
+    }
+    app.buf.commit_group();
+    app.jump_to(start);
+    app.message = format!(
+        "patched {n} byte(s) @ 0x{start:X}{} (:w to save)",
+        if n < bytes.len() { " (clamped to EOF)" } else { "" }
+    );
+}
+
+fn cmd_pipelines(app: &mut App) {
+    let mut lines = if app.pipelines.is_empty() {
+        vec![
+            "no named pipelines.".to_string(),
+            "define them in ~/.bxpipes:  name = op | op | …".to_string(),
+        ]
+    } else {
+        let mut v = vec![format!("{} pipeline(s) (~/.bxpipes):", app.pipelines.len())];
+        let mut names: Vec<&String> = app.pipelines.keys().collect();
+        names.sort();
+        for name in names {
+            v.push(format!("  {name} = {}", app.pipelines[name].join(" | ")));
+        }
+        v
+    };
+    lines.push(String::new());
+    lines.push(format!("ops: {}", crate::transform::OP_NAMES.join(" ")));
+    app.output_lines = lines;
+    app.side_tab = SideTab::Output;
+    app.side_scroll = 0;
+}
+
+/// Re-read `~/.bxpipes` so edits take effect without restarting, then show the
+/// refreshed list in the Output panel.
+fn cmd_reloadpipes(app: &mut App) {
+    let (pipes, warnings) = crate::transform::load_pipelines();
+    let n = pipes.len();
+    app.pipelines = pipes;
+    cmd_pipelines(app); // repaints the Output panel with the new list
+    for w in &warnings {
+        app.output_lines.push(w.clone());
+    }
+    app.message = format!("reloaded ~/.bxpipes: {n} pipeline(s)");
+}
+
 /// Parse `u32le` / `u32be` / `u64le` / `u64be` into `(width, little_endian)`.
 fn parse_ptr_type(s: &str) -> Option<(u8, bool)> {
     match s.to_ascii_lowercase().as_str() {
@@ -505,6 +591,9 @@ bx commands:
   :xor / :cyclic                analyze last visual selection (also x / c)
   :checksum [start end]         CRC/MD5/SHA of selection or file (also #)
   :strings [min] [utf16]        list strings (Strings tab) · \\ or :sfind to filter
+  :transform [pipe] (also T)    pipe a selection through transforms (Transform tab)
+  :t <op>  :tpop :tclear        add/remove recipe steps · :tsave <f> · :tpatch
+  :pipelines / :reloadpipes     list / re-read named recipes (~/.bxpipes)
   :follow / :xref [u32le|…]     follow pointer (f/F) · find pointers here (X)
   :base <hex> / :endian le|be   pointer load base / byte order for follow+xref
   :bookmarks / :jumps           list bookmarks · jump-list state

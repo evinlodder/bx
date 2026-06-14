@@ -36,6 +36,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         SideTab::Template => (template_lines(app), app.side_scroll, false),
         SideTab::Inspect => (inspect_lines(app), app.side_scroll, true),
         SideTab::Strings => (strings_lines(app, body), 0, false),
+        SideTab::Transform => (transform_lines(app, body), app.side_scroll, true),
         SideTab::Analysis => (
             app.info_lines().into_iter().map(Line::from).collect(),
             app.side_scroll,
@@ -59,6 +60,7 @@ fn tab_title(t: SideTab) -> &'static str {
         SideTab::Template => "Template",
         SideTab::Inspect => "Inspect",
         SideTab::Strings => "Strings",
+        SideTab::Transform => "Transform",
         SideTab::Analysis => "Analysis",
         SideTab::Entropy => "Entropy",
         SideTab::Output => "Output",
@@ -109,6 +111,92 @@ fn tab_header_line(titles: &[&str], selected: usize, width: u16) -> Line<'static
     }
     spans.push(Span::styled(if right { ">" } else { " " }.to_string(), arrow));
     Line::from(spans)
+}
+
+fn transform_lines(app: &App, body: Rect) -> Vec<Line<'static>> {
+    let Some((s, e)) = app.tx_input else {
+        return vec![
+            Line::from("no transform input"),
+            Line::from(""),
+            Line::from("select bytes (v), press T — or :transform"),
+            Line::from("then :t <op> (e.g. :t unbase64, :t xor 5a)"),
+            Line::from(":pipelines lists named recipes (~/.bxpipes)"),
+        ];
+    };
+    let mut out = Vec::new();
+    let dim = Style::default().fg(Color::DarkGray);
+    out.push(Line::from(vec![
+        Span::styled("input ", dim),
+        Span::styled(
+            format!("0x{s:X}..0x{e:X} ({} B)", e - s),
+            Style::default().fg(app.config.color_annotation),
+        ),
+    ]));
+
+    out.push(Line::from(Span::styled("recipe:", dim)));
+    if app.tx_recipe.is_empty() {
+        out.push(Line::from(Span::styled("  (empty — :t <op> to add)", dim)));
+    } else {
+        for (i, op) in app.tx_recipe.iter().enumerate() {
+            out.push(Line::from(vec![
+                Span::styled(format!("  {}. ", i + 1), dim),
+                Span::styled(
+                    op.clone(),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+    }
+    out.push(Line::from(""));
+
+    match &app.tx_output {
+        Some(Ok(bytes)) => {
+            out.push(Line::from(Span::styled(
+                format!("output: {} byte(s)", bytes.len()),
+                Style::default().fg(Color::Green),
+            )));
+            // hex preview, sized to the pane
+            let cols = ((body.width as usize).saturating_sub(2) / 4).clamp(4, 16);
+            let rows = (body.height as usize).saturating_sub(out.len() + 2).max(2);
+            for chunk in bytes.chunks(cols).take(rows) {
+                let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02X}")).collect();
+                let ascii: String = chunk
+                    .iter()
+                    .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '·' })
+                    .collect();
+                out.push(Line::from(vec![
+                    Span::raw(format!("{:<width$} ", hex.join(" "), width = cols * 3)),
+                    Span::styled(ascii, dim),
+                ]));
+            }
+            if bytes.len() > cols * rows {
+                out.push(Line::from(Span::styled("  …", dim)));
+            }
+            // text rendering, if it looks textual
+            let printable = bytes
+                .iter()
+                .filter(|&&b| (0x20..0x7f).contains(&b) || b == b'\n' || b == b'\t')
+                .count();
+            if !bytes.is_empty() && printable * 100 / bytes.len() >= 90 {
+                out.push(Line::from(Span::styled("── as text ──", dim)));
+                let text: String = bytes
+                    .iter()
+                    .take(2048)
+                    .map(|&b| if b == b'\n' { ' ' } else { b as char })
+                    .collect();
+                out.push(Line::from(Span::styled(
+                    text,
+                    Style::default().fg(Color::White),
+                )));
+            }
+        }
+        Some(Err(msg)) => out.push(Line::from(Span::styled(
+            format!("error: {msg}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))),
+        None => out.push(Line::from(Span::styled("(no output)", dim))),
+    }
+    out
 }
 
 fn template_lines(app: &App) -> Vec<Line<'static>> {

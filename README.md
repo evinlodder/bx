@@ -71,6 +71,7 @@ tab of the side pane.
 | `x` | XOR brute-force the selection (keys 0x00–0xFF, printable hits ranked) |
 | `c` | cyclic / repeating-structure detection on the selection |
 | `#` | checksums (CRC32/MD5/SHA1/SHA256/…) of the selection, or whole file |
+| `T` | open the selection in the transform pipeline (Transform tab) |
 | `gt` / `gT` | switch to next / previous open file |
 | `i` | edit mode — type hex nibbles; `Tab` switches to ASCII overtype; `Esc` ends |
 | `u` / `Ctrl-r` | undo / redo (grouped per edit session) |
@@ -200,6 +201,46 @@ without restarting. Parse errors report the source line (`ls.bxs:line 3: …`).
 - **Data inspector** — the **Inspect** tab decodes the bytes at the cursor as
   every integer width (signed/unsigned, LE/BE), `float32`/`float64`, a 32-bit
   `time_t`, plus hex/octal/binary/ASCII — live, no `:mark` needed.
+
+Pattern/string search uses Boyer-Moore-Horspool with a bad-character skip table
+(wildcard-aware), so even multi-hundred-MB files scan in a fraction of a second.
+
+## Transform pipeline (CyberChef-style)
+
+Pipe a selection through an ordered **recipe** of operations and see the result
+live in the **Transform** tab. Select bytes and press `T` (or `:transform`),
+then build the recipe:
+
+```
+:t unbase64           # add a step
+:t xor 5a             # … then another (data flows through each)
+:t pipe zcat          # pipe through any external program
+:tpop  :tclear        # remove last step / clear
+:tsave out.bin        # write the output to a file
+:tpatch               # overwrite the output back into the buffer (then :w)
+```
+
+Built-in ops (pure-Rust, no deps): `hex`/`unhex`, `base64`/`unbase64`,
+`url`/`unurl`, `xor <key>`, `add`/`sub <n>`, `not`, `rol`/`ror <n>`, `reverse`,
+`swap16`/`swap32`/`swap64`, `rot13`, `upper`/`lower`, `take`/`drop <n>`,
+`md5`/`sha1`/`sha256`/`crc32`.
+
+**Your own transforms, two ways:**
+
+- **`pipe <cmd>`** streams the bytes through any external program's
+  stdin/stdout (`pipe openssl enc -d …`, `pipe ./my_decoder.py`), so a step can
+  be written in any language. *(Runs a shell command — only ones you type/configure.)*
+- **Named recipes** in `~/.bxpipes` compose built-ins into reusable pipelines:
+
+  ```ini
+  # ~/.bxpipes  —  name = op | op | …
+  deflate_text = pipe zcat | strings
+  deobfuscate  = unbase64 | xor 5a | rot13
+  ```
+
+  Load one with `:transform <name>`; `:pipelines` lists them in the Output
+  panel; `:reloadpipes` re-reads the file so edits take effect without
+  restarting bx.
 
 ## Multiple files
 

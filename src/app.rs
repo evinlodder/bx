@@ -42,6 +42,7 @@ pub enum SideTab {
     Template,
     Inspect,
     Strings,
+    Transform,
     Analysis,
     Entropy,
     Output,
@@ -49,11 +50,12 @@ pub enum SideTab {
 
 impl SideTab {
     /// Display order, for the tab strip and next/prev cycling.
-    pub const ORDER: [SideTab; 7] = [
+    pub const ORDER: [SideTab; 8] = [
         Self::Marks,
         Self::Template,
         Self::Inspect,
         Self::Strings,
+        Self::Transform,
         Self::Analysis,
         Self::Entropy,
         Self::Output,
@@ -116,6 +118,10 @@ pub struct Document {
     pub strings_filter: String,
     /// Paths of collapsed groups in the Marks tree.
     pub collapsed: HashSet<String>,
+    /// Transform pipeline: input range, recipe (op strings), cached output.
+    pub tx_input: Option<(u64, u64)>,
+    pub tx_recipe: Vec<String>,
+    pub tx_output: Option<Result<Vec<u8>, String>>,
 }
 
 impl Document {
@@ -157,6 +163,9 @@ impl Document {
             strings_utf16: false,
             strings_filter: String::new(),
             collapsed: HashSet::new(),
+            tx_input: None,
+            tx_recipe: Vec::new(),
+            tx_output: None,
         };
         doc.reanalyze();
         doc.detect_ptr_defaults();
@@ -314,6 +323,8 @@ pub struct App {
     pub message: String,
     pub side_tab: SideTab,
     pub side_scroll: u16,
+    /// Named transform recipes loaded from `~/.bxpipes`.
+    pub pipelines: std::collections::HashMap<String, Vec<String>>,
     pub quit: bool,
 }
 
@@ -346,6 +357,7 @@ impl App {
             message: String::new(),
             side_tab: SideTab::Analysis,
             side_scroll: 0,
+            pipelines: std::collections::HashMap::new(),
             quit: false,
         };
         app.message = format!(
@@ -713,6 +725,14 @@ impl App {
                     self.mode = Mode::Normal;
                 }
                 self.run_checksum(range);
+            }
+            KeyCode::Char('T') => {
+                let range = self.selection_or_last();
+                if self.mode == Mode::Visual {
+                    self.leave_visual();
+                    self.mode = Mode::Normal;
+                }
+                self.start_transform(range, None);
             }
             KeyCode::Char('m') if self.mode == Mode::Visual => {
                 let (s, e) = self.selection().unwrap();
@@ -1178,6 +1198,76 @@ impl App {
             let computed =
                 crate::analysis::strings::extract(self.buf.raw(), self.strings_min, self.strings_utf16);
             self.strings_cache = Some(computed);
+        }
+    }
+
+    // --- transform pipeline ---------------------------------------------------
+
+    /// Begin a transform with the given input range (or the last selection /
+    /// whole file), optionally loading a named pipeline. Switches to the tab.
+    pub fn start_transform(&mut self, range: Option<(u64, u64)>, pipeline: Option<&str>) {
+        let input = range
+            .or(self.selection())
+            .or(self.last_selection)
+            .unwrap_or((0, self.buf.len()));
+        self.tx_input = Some(input);
+        if let Some(name) = pipeline {
+            match self.pipelines.get(name).cloned() {
+                Some(recipe) => self.tx_recipe = recipe,
+                None => {
+                    self.message = format!("no pipeline '{name}' (see ~/.bxpipes / :pipelines)");
+                    return;
+                }
+            }
+        }
+        self.recompute_transform();
+        self.side_tab = SideTab::Transform;
+        self.side_scroll = 0;
+        let (s, e) = input;
+        self.message = format!("transform input 0x{s:X}..0x{e:X} ({} B)", e - s);
+    }
+
+    /// Re-run the recipe over the input bytes and cache the result. Only called
+    /// on explicit edits (never per-frame), since `pipe` ops spawn processes.
+    pub fn recompute_transform(&mut self) {
+        let Some((s, e)) = self.tx_input else {
+            self.tx_output = None;
+            return;
+        };
+        let input = self.buf.get_range(s, (e.saturating_sub(s)) as usize);
+        self.tx_output = Some(crate::transform::run(&self.tx_recipe, &input));
+    }
+
+    pub fn transform_push(&mut self, op: &str) {
+        if self.tx_input.is_none() {
+            self.start_transform(None, None);
+        }
+        self.tx_recipe.push(op.trim().to_string());
+        self.recompute_transform();
+        self.side_tab = SideTab::Transform;
+        self.message = format!("+ {op}");
+    }
+
+    pub fn transform_pop(&mut self) {
+        if self.tx_recipe.pop().is_some() {
+            self.recompute_transform();
+            self.message = "removed last op".into();
+        } else {
+            self.message = "recipe is empty".into();
+        }
+    }
+
+    pub fn transform_clear(&mut self) {
+        self.tx_recipe.clear();
+        self.recompute_transform();
+        self.message = "cleared recipe".into();
+    }
+
+    /// Current transform output bytes, if the recipe ran cleanly.
+    pub fn transform_output(&self) -> Option<&[u8]> {
+        match &self.tx_output {
+            Some(Ok(v)) => Some(v),
+            _ => None,
         }
     }
 
