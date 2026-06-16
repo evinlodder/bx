@@ -21,8 +21,7 @@ deep-dive there — not a replacement for either.
 > [!NOTE]
 > **Disclaimer:** this is primarily a curiosity / hobby project, and a large
 > portion of the code is AI-generated. It's reasonably tested but has not been
-> battle-hardened — treat it accordingly, and don't rely on it for anything
-> safety- or security-critical without reviewing the code yourself.
+> battle-hardened — treat it accordingly.
 
 ```
 ┌ fw.bin ────────────────────────────────────────────────┐┌───────────────────────────┐
